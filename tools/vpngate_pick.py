@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
-"""在 CI 里挑一个可用的 VPN Gate 节点并拉起 sing-box。
+"""在 CI 里拉起一个可用的 VPN Gate 出口（sing-box mixed inbound）。
 
-为什么单独一个文件：逻辑要读 base64 的 OpenVPN 配置、反复起停子进程、
-经代理取 IP，塞进 YAML 的 heredoc 里缩进容易出错，也不好单独测。
+为什么是「一次打包多个节点」而不是「一个一个试」：
+  单个节点试出来的路径太脆——VPN Gate 的免费节点随时 reset，逐试的失败率高到
+  跑十几次都挑不出一个。vpngate_to_singbox.py 的 --csv 模式能把一批节点写进
+  同一份配置，outbounds 里自带 urltest（tag=auto），由 sing-box 自己在运行时
+  选路，所以只要这批里有一个活的，代理端口就是通的。
 
-前置（由 workflow 准备好，工作目录就是 $W/vp）：
+前置（workflow 已备好，工作目录就是 $W/vp）：
   ./nodes.csv              VPN Gate 官方快照
   ./sing-box               sing-box 可执行
-  ./vpngate_to_singbox.py  把 .ovpn 转成 sing-box 配置
+  ./vpngate_to_singbox.py  --csv 模式的转换器
 
 产出：
-  ./sb.json                选中的 sing-box 配置
-  ./proxy.env              形如 http_proxy=http://127.0.0.1:18080，给 $GITHUB_ENV 用
-  ./sb.log                 sing-box 运行日志
+  ./sb.json     含 N 个 endpoints + mixed inbound(127.0.0.1:18080)
+  ./proxy.env   给 $GITHUB_ENV 用的代理变量
+  ./sb.log      sing-box 日志
 
-退出码：0 = 挑到可用节点；1 = 一个都不通。
+退出码：0 = 代理通了；1 = 这批节点都不通。
 """
 
 from __future__ import annotations
 
-import base64
+import json
 import os
+import socket
 import subprocess
 import sys
 import time
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 WORK = os.getcwd()
-
 CSV = os.path.join(WORK, "nodes.csv")
 SINGBOX = os.path.join(WORK, "sing-box")
 CONVERTER = os.path.join(WORK, "vpngate_to_singbox.py")
@@ -37,68 +39,32 @@ PROXY_ENV = os.path.join(WORK, "proxy.env")
 SB_LOG = os.path.join(WORK, "sb.log")
 
 MIXED_PORT = 18080
-MAX_NODES = 20
+POOL_SIZE = int(os.environ.get("VPNGATE_POOL", "25"))
 PROBE_URL = "https://api.ipify.org"
-STARTUP_WAIT = 4.0
 
 
-def parse_nodes(path: str) -> list[tuple[int, str, str]]:
-    """VPN Gate 快照：首行 *vpn_servers，其余 # 开头是注释/表头，数据行逗号分隔。
-
-    返回 [(score, hostname, base64_ovpn)]，按 score 降序。
-    """
-    rows: list[tuple[int, str, str]] = []
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("*") or line.startswith("#"):
-                continue
-            parts = line.split(",")
-            # 第 15 列（index 14）是 base64 OpenVPN 配置；列表头有 15 列
-            if len(parts) < 15:
-                continue
-            host = parts[0]
-            # public-vpn-* 是 VPN Gate 的公共中继，握手经常被 reset（实测过一整轮全 fails）；
-            # 直接跳过，优先用真实 ISP 节点。
-            if host.startswith("public-vpn-"):
-                continue
-            try:
-                score = int(parts[2] or 0)
-            except ValueError:
-                score = 0
-            rows.append((score, host, parts[14]))
-    rows.sort(key=lambda r: r[0], reverse=True)
-    return rows
-
-
-def write_ovpn(b64: str) -> bool:
-    try:
-        raw = base64.b64decode(b64, validate=False)
-    except Exception:
-        return False
-    if b"remote " not in raw:
-        return False
-    with open(os.path.join(WORK, "node.ovpn"), "wb") as fh:
-        fh.write(raw)
-    return True
-
-
-def convert() -> bool:
-    # --mixed 收的是 HOST:PORT，不是裸端口（传 "18080" 会生成没有 inbound 的配置，
-    # sing-box 起来但不监听，探测表现为 connection refused）。
+def build_pool() -> int:
+    """把一批节点写成一份带 mixed inbound 的配置，返回 endpoints 数量。"""
     proc = subprocess.run(
-        [sys.executable, CONVERTER, "--input", "node.ovpn", "--output", CONFIG,
+        [sys.executable, CONVERTER,
+         "--csv", CSV,
+         "--output", CONFIG,
+         "--limit", str(POOL_SIZE),
+         "--no-probe",                       # 不做拨号排序，交给 sing-box 运行时 urltest
          "--mixed", f"127.0.0.1:{MIXED_PORT}"],
         cwd=WORK, capture_output=True, text=True,
     )
     if proc.returncode != 0:
-        print(f"  convert failed rc={proc.returncode}: {(proc.stderr or '')[-300:]}")
-        return False
-    return os.path.exists(CONFIG) and os.path.getsize(CONFIG) > 0
+        print(f"[convert] rc={proc.returncode}")
+        print((proc.stderr or "")[-800:])
+        return 0
+    print((proc.stdout or "").strip()[-300:])
+    with open(CONFIG, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    return len(cfg.get("endpoints", []))
 
 
-def wait_port(port: int, timeout: float = 12.0) -> bool:
-    import socket
+def wait_port(port: int, timeout: float = 20.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         with socket.socket() as sock:
@@ -109,12 +75,6 @@ def wait_port(port: int, timeout: float = 12.0) -> bool:
     return False
 
 
-def start_singbox() -> subprocess.Popen:
-    log = open(SB_LOG, "w")
-    return subprocess.Popen([SINGBOX, "run", "-c", CONFIG], cwd=WORK,
-                            stdout=log, stderr=subprocess.STDOUT)
-
-
 def probe() -> str | None:
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({
@@ -123,10 +83,10 @@ def probe() -> str | None:
         })
     )
     try:
-        with opener.open(PROBE_URL, timeout=25) as resp:
+        with opener.open(PROBE_URL, timeout=30) as resp:
             return resp.read().decode("utf-8", "replace").strip()
-    except Exception as exc:  # noqa: BLE001 - 任何异常都只意味着这个节点不行
-        print(f"  probe failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  probe: {exc}")
         return None
 
 
@@ -136,28 +96,24 @@ def main() -> int:
             print(f"::error:: 缺少 {path}")
             return 1
 
-    rows = parse_nodes(CSV)
-    print(f"候选节点 {len(rows)} 个，试前 {min(len(rows), MAX_NODES)} 个")
-    if not rows:
-        print("::error:: nodes.csv 里没有可用数据行")
+    count = build_pool()
+    print(f"配置里 endpoints={count}")
+    if count == 0:
+        print("::error:: 没生成任何 endpoint")
         return 1
 
-    for score, host, b64 in rows[:MAX_NODES]:
-        print(f"--- {host} score={score}")
-        if not write_ovpn(b64):
-            continue
-        if not convert():
-            continue
-        proc = start_singbox()
-        if not wait_port(MIXED_PORT):
-            print("  sing-box 没监听，日志尾部：")
-            try:
-                with open(SB_LOG, encoding="utf-8", errors="replace") as fh:
-                    print("\n".join(fh.read().splitlines()[-6:]))
-            except OSError:
-                pass
-            proc.terminate()
-            continue
+    log = open(SB_LOG, "w")
+    proc = subprocess.Popen([SINGBOX, "run", "-c", CONFIG], cwd=WORK,
+                            stdout=log, stderr=subprocess.STDOUT)
+    if not wait_port(MIXED_PORT):
+        print("::error:: sing-box 没监听")
+        for line in open(SB_LOG, encoding="utf-8", errors="replace").read().splitlines()[-10:]:
+            print("  " + line)
+        proc.terminate()
+        return 1
+
+    # urltest 选路需要几秒，给它三轮机会
+    for attempt in range(1, 6):
         ip = probe()
         if ip:
             with open(PROXY_ENV, "w", encoding="utf-8") as fh:
@@ -166,15 +122,14 @@ def main() -> int:
                 fh.write(f"ALL_PROXY=http://127.0.0.1:{MIXED_PORT}\n")
                 fh.write("NO_PROXY=127.0.0.1,localhost\n")
                 fh.write("no_proxy=127.0.0.1,localhost\n")
-            print(f"[OK] {host} -> 出口 IP {ip}（sing-box pid={proc.pid} 留活）")
+            print(f"[OK] 第 {attempt} 次探测通过，出口 IP={ip}（sing-box pid={proc.pid} 留活）")
             return 0
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        time.sleep(5)
 
-    print("::error:: 试过的节点全部不通")
+    print("::error:: 这批节点都没通")
+    for line in open(SB_LOG, encoding="utf-8", errors="replace").read().splitlines()[-15:]:
+        print("  " + line)
+    proc.terminate()
     return 1
 
 
