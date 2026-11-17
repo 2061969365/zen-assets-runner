@@ -1,0 +1,42 @@
+{
+ "seq": 1,
+ "ts": 1792827587.0,
+ "method": "POST",
+ "path": "/inference/v1/chat/completions",
+ "headers": [
+  [
+   "user-agent",
+   "opencode/latest/2.2.5/cli"
+  ],
+  [
+   "content-type",
+   "application/json"
+  ],
+  [
+   "accept",
+   "text/event-stream"
+  ],
+  [
+   "x-opencode-client",
+   "cli"
+  ],
+  [
+   "x-opencode-project",
+   "5f1c0a9b8d7e6f4a3b2c1d0e"
+  ],
+  [
+   "x-opencode-session",
+   "<redacted>"
+  ],
+  [
+   "x-session-id",
+   "<redacted>"
+  ],
+  [
+   "authorization",
+   "<redacted>"
+  ]
+ ],
+ "body_len": 824,
+ "body": "{\n \"model\": \"deepseek-v4.1-flash-free\",\n \"messages\": [\n  {\n   \"role\": \"system\",\n   \"content\": \"You are a title generator. You read a conversation between a user and a coding agent, then produce a short, specific title in the user's language. The title must name only the core action and subject, at most 50 characters, with no quotes, no trailing punctuation, and no execution details such as frequency, scheduled dates, time zones, status, or configuration. Prefer the concrete target identifier (file, module, service, PR number, branch name) over generic phrasing. Do not describe the conversation, do not mention the assistant, and do not answer the user's question. Output the title and nothing else.\\n\"\n  },\n  {\n   \"role\": \"user\",\n   \"content\": \"Reply with the single word: ok\"\n  }\n ],\n \"tools\": [],\n \"stream\": false\n}"
+}

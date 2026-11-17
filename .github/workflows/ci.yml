@@ -1,0 +1,36 @@
+name: ci
+
+# PR / main 上的校验：单元测试 + 资产业务校验。
+# 只允许 actions/checkout 与 actions/setup-python，其余一律用 python/标准库完成。
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate assets
+        run: python tools/validate_assets.py --assets assets --tools-only

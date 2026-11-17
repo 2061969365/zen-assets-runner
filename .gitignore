@@ -1,0 +1,11 @@
+# 抓包产物含 session id / project id，绝不入库
+captures/
+bodies/
+_cap/
+assets_candidate/
+*.log
+
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

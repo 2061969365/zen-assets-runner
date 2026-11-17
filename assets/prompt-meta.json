@@ -1,0 +1,8 @@
+{
+  "sha256": "8ae149145f203932aa8053bd80690e03d4bfad01be89de58f06eb69e8fbdd6e0",
+  "bytes": 102499,
+  "chars": 94858,
+  "cli_version": "2.2.5",
+  "captured_at": "2026-11-17T07:39:47Z",
+  "note": "public runner 只存摘要，全文在私有仓库 zen-assets（契约 §8）"
+}

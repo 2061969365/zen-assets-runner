@@ -1,0 +1,696 @@
+name: refresh-assets
+
+# 每日抓一次“官方 CLI 到底发了什么”，与 assets/ 做 canonical diff。
+#
+# 四态（docs/asset-format.md §5，禁止静默）：
+#   NO_CAPTURE   -> exit 1 + gh issue create（label no-capture）
+#   EXTRACT_FAIL -> exit 1 + gh issue create（label extract-fail）
+#   DRIFT        -> 开 PR（label asset-drift）
+#   NO_DRIFT     -> 打印 NO_DRIFT，exit 0
+#
+# 全程不接触上游：CLI 的 baseURL 指向本机 tools/sink.py，零额度、不会被 429。
+#
+# 脱敏（docs/asset-format.md §6 四层）：
+#   1 采集层 sink.py 负责；2 提取层 extract_assets.py 负责（本文件不二次加工）
+#   3 提交前：对 candidate 与 assets/ 全文扫描 Bearer / ses_ / ghp_ / sk- / [0-9a-f]{24}，命中即 fail
+#   4 artifact：只上传 _cap/candidate，原始 captures（_cap/bodies）绝不上传
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+permissions:
+  contents: write        # push asset-drift/* 分支、提交 candidate
+  pull-requests: write   # gh pr create
+  issues: write          # NO_CAPTURE / EXTRACT_FAIL 时 gh issue create
+  actions: write         # PR 建好后显式派发 ci.yml（GITHUB_TOKEN 推的分支不会自动触发）
+
+# 防叠加：上一轮没跑完时新的等待（不 cancel，避免把正在推的 PR 打断）
+concurrency:
+  group: refresh-assets
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      W: ${{ github.workspace }}/_cap
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      OPENCODE_DISABLE_AUTOUPDATE: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      # PR 上的 ci 会停在 action_required（GITHUB_TOKEN 推的分支触发的工作流需要人工
+      # 批准），所以闸门必须在产出方就执行一遍：这里是唯一能让 PR 内容可信的地方。
+      - name: Self-check (unit tests + current assets)
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -v
+          python3 tools/validate_assets.py --assets assets --strict --tools-only
+
+      - name: Install @opencode/cli@latest and record version
+        run: |
+          set -euo pipefail
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+          npm install -g @opencode/cli@latest 2>&1 | tail -5
+          echo "$NPM_CONFIG_PREFIX/bin" >> "$GITHUB_PATH"
+          CLI_VER="$(opencode --version 2>&1 | tail -1 | tr -d '\r')"
+          if [ -z "$CLI_VER" ]; then
+            echo "opencode --version 输出为空"
+            exit 1
+          fi
+          echo "CLI_VER=$CLI_VER" >> "$GITHUB_ENV"
+          echo "CLI version: $CLI_VER"
+
+      - name: Start local capture sink and wait for the port
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/bodies" "$W/candidate"
+          python3 tools/sink.py --port 19100 --out "$W/bodies" >"$W/sink.log" 2>&1 &
+          echo "SINK_PID=$!" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import socket
+          import sys
+          import time
+
+          deadline = time.time() + 30
+          while time.time() < deadline:
+              try:
+                  with socket.create_connection(("127.0.0.1", 19100), timeout=1.0):
+                      print("sink ready on 127.0.0.1:19100")
+                      sys.exit(0)
+              except OSError:
+                  time.sleep(0.2)
+          print("sink not ready after 30s")
+          sys.exit(1)
+          PY
+          cat "$W/sink.log"
+
+      - name: Capture one real CLI request (baseURL -> sink)
+        # baseURL 注入方式与 zen-direct-v2/.github/workflows/capture-cli-vs-gateway.yml 一致：
+        # CLI 照常构造请求（工具定义 + system prompt），只是发到 127.0.0.1。
+        # CLI 自身退出码不作为判据（sink 已拿到 body 也有价值），由 extract 决定四态。
+        run: |
+          set -euo pipefail
+          set +e
+          OPENCODE_CONFIG_CONTENT='{"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:19100/inference/v1"}}}}' \
+            timeout --signal=TERM --kill-after=15 240 \
+              opencode run -m opencode/deepseek-v4.1-flash-free "Reply with the single word: ok" \
+              >"$W/cli.out" 2>"$W/cli.err"
+          CLI_EXIT=$?
+          set -e
+          BODY_COUNT="$(find "$W/bodies" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')"
+          {
+            echo "CLI_EXIT=$CLI_EXIT"
+            echo "BODY_COUNT=$BODY_COUNT"
+          } >> "$GITHUB_ENV"
+          echo "cli_exit=$CLI_EXIT captured_requests=$BODY_COUNT"
+          tail -3 "$W/cli.out" || true
+          tail -12 "$W/cli.err" || true
+
+      - name: Extract candidate assets
+        # 分类依据优先取 extract_assets.py 自己的 --report-json 里的 status
+        # （EXIT_OK=0 / EXIT_FAIL=1，两种失败共用 1，故不能只看退出码）。
+        # 没有 report（例如脚本缺失、argparse 用法错误）时才退回启发式：
+        #   原始请求 0 条 -> NO_CAPTURE，有请求 -> EXTRACT_FAIL。
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/candidate"
+          set +e
+          python3 tools/extract_assets.py \
+            --captures "$W/bodies" \
+            --out "$W/candidate" \
+            --cli-version "$CLI_VER" \
+            --report-json "$W/extract-report.json" \
+            >"$W/extract.out" 2>&1
+          EXTRACT_EXIT=$?
+          set -e
+          CANDIDATE_OK=0
+          if [ -s "$W/candidate/official_tools.json" ] && [ -s "$W/candidate/prompt.txt" ]; then
+            CANDIDATE_OK=1
+          fi
+          REPORT_STATUS="none"
+          if [ -f "$W/extract-report.json" ]; then
+            REPORT_STATUS="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8")).get("status") or "none")' "$W/extract-report.json" 2>/dev/null || echo none)"
+          fi
+          STATE=EXTRACT_FAIL
+          if [ "$EXTRACT_EXIT" -eq 0 ] && [ "$CANDIDATE_OK" -eq 1 ]; then
+            STATE=PENDING
+          elif [ "$REPORT_STATUS" = "NO_CAPTURE" ]; then
+            STATE=NO_CAPTURE
+          elif [ "${BODY_COUNT:-0}" -eq 0 ]; then
+            # 抓包目录里一条请求都没有 -> 确属没抓到
+            STATE=NO_CAPTURE
+          fi
+          {
+            echo "EXTRACT_EXIT=$EXTRACT_EXIT"
+            echo "CANDIDATE_OK=$CANDIDATE_OK"
+            echo "REPORT_STATUS=$REPORT_STATUS"
+            echo "STATE=$STATE"
+          } >> "$GITHUB_ENV"
+          echo "extract_exit=$EXTRACT_EXIT candidate_ok=$CANDIDATE_OK report_status=$REPORT_STATUS state=$STATE"
+          tail -40 "$W/extract.out" || true
+
+      - name: Validate candidate assets
+        if: env.STATE == 'PENDING'
+        run: |
+          set -euo pipefail
+          set +e
+          python3 tools/validate_assets.py --assets "$W/candidate" >"$W/validate.out" 2>&1
+          VALIDATE_EXIT=$?
+          set -e
+          echo "VALIDATE_EXIT=$VALIDATE_EXIT" >> "$GITHUB_ENV"
+          tail -40 "$W/validate.out" || true
+          if [ "$VALIDATE_EXIT" -ne 0 ]; then
+            {
+              echo "STATE=EXTRACT_FAIL"
+              echo "FAIL_REASON=候选有内容但 validate_assets.py 自检不过 (exit=$VALIDATE_EXIT)"
+            } >> "$GITHUB_ENV"
+            echo "candidate 自检不过：exit=$VALIDATE_EXIT"
+          fi
+
+      - name: Redaction gate on candidate (Bearer / ses_ / ghp_ / sk- / 24-hex)
+        # 第 3 层脱敏。命中即失败：candidate 目录直接清空，避免脏内容被 artifact 带出去。
+        if: env.STATE == 'PENDING'
+        run: |
+          set -euo pipefail
+          REDACT_EXIT=0
+          set +e
+          python3 - "$W/candidate" >"$W/redact.out" 2>&1 <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          # 三个前缀都加"左边界 + 最小 token 长度"：
+          # 裸写 sk- 会命中正常英文词（task-oriented / risk-control），每天都会误报。
+          # 24-hex 加前后边界，避免 64 位 sha256 里的 24 位子串被误判成 project id。
+          GUARD = r"(?<![A-Za-z0-9_])"
+          PATTERNS = [
+              ("Bearer ", re.compile(GUARD + r"Bearer ")),
+              ("ses_", re.compile(GUARD + r"ses_[A-Za-z0-9]{8,}")),
+              ("ghp_", re.compile(GUARD + r"ghp_[A-Za-z0-9]{16,}")),
+              ("sk-", re.compile(GUARD + r"sk-[A-Za-z0-9_-]{10,}")),
+              ("[0-9a-f]{24}", re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{24}(?![0-9a-fA-F])")),
+          ]
+
+          hits = 0
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8", errors="replace")
+              except OSError:
+                  continue
+              for lineno, line in enumerate(text.splitlines(), 1):
+                  for label, pattern in PATTERNS:
+                      if pattern.search(line):
+                          hits += 1
+                          print(f"HIT {path}:{lineno} pattern={label}")
+
+          if hits:
+              print(f"redaction gate failed: {hits} hit(s)")
+              sys.exit(1)
+          print("redaction gate clean")
+          PY
+          REDACT_EXIT=$?
+          set -e
+          echo "REDACT_EXIT=$REDACT_EXIT" >> "$GITHUB_ENV"
+          cat "$W/redact.out" || true
+          if [ "$REDACT_EXIT" -ne 0 ]; then
+            rm -rf "$W/candidate"
+            mkdir -p "$W/candidate"
+            {
+              echo "STATE=EXTRACT_FAIL"
+              echo "FAIL_REASON=脱敏命中：候选里出现 token 形态，已清空 candidate 且不上传"
+            } >> "$GITHUB_ENV"
+            echo "脱敏命中，candidate 已清空"
+          fi
+
+      - name: Canonical diff against assets/
+        # 比较 json 的 canonical 形式（sort_keys + 紧凑分隔符）与 prompt 的 sha256。
+        # 不用文本 diff：文本 diff 会把 captured_at / source.run_url / 末尾空白算成漂移。
+        # 漂移判据只含 order + tools（description/parameters/strict）+ prompt 正文。
+        if: env.STATE == 'PENDING'
+        run: |
+          set -euo pipefail
+          W="$W" ASSETS_DIR="$GITHUB_WORKSPACE/assets" CAND_DIR="$W/candidate" \
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          W = pathlib.Path(os.environ["W"])
+          cur_dir = pathlib.Path(os.environ["ASSETS_DIR"])
+          cand_dir = pathlib.Path(os.environ["CAND_DIR"])
+          run_url = os.environ.get("RUN_URL", "")
+
+
+          def canon(obj):
+              return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+          def sha(text):
+              return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+          def read_json(path):
+              return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+
+
+          cur = read_json(cur_dir / "official_tools.json")
+          cand = read_json(cand_dir / "official_tools.json")
+          cand_prompt_raw = (cand_dir / "prompt.txt").read_text(encoding="utf-8")
+          # prompt 的 canonical 形式与 extract_assets.py 一致：rstrip + 单个换行
+          # （这样 PR 里的 prompt 字节数/ sha 与 --report-json 的 prompt_bytes 对得上）
+          cand_prompt = cand_prompt_raw.rstrip() + "\n"
+          # 契约 §8：public runner 仓库不存 prompt 全文，当前值只能从 prompt-meta.json
+          # 取摘要。所以 prompt 的比较是「候选 sha vs 摘要 sha」，不涉及正文。
+          meta_path = cur_dir / "prompt-meta.json"
+          cur_meta = read_json(meta_path) if meta_path.is_file() else {}
+
+          cur_tools = cur.get("tools") or {}
+          cand_tools = cand.get("tools") or {}
+          cur_order = cur.get("order") or []
+          cand_order = cand.get("order") or []
+
+          cur_core = {"order": cur_order, "tools": cur_tools}
+          cand_core = {"order": cand_order, "tools": cand_tools}
+          sha_cur = sha(canon(cur_core))
+          sha_cand = sha(canon(cand_core))
+          sha_cur_prompt = cur_meta.get("sha256") or "(unknown)"
+          sha_cand_prompt = sha(cand_prompt)
+          sha_cand_tools = sha(canon(cand_tools))
+
+          added = [n for n in cand_order if n not in cur_tools]
+          removed = [n for n in cur_order if n not in cand_tools]
+          for name in cand_tools:
+              if name not in cur_tools and name not in added:
+                  added.append(name)
+          for name in cur_tools:
+              if name not in cand_tools and name not in removed:
+                  removed.append(name)
+
+          changed = []
+          for name in [n for n in cand_order if n in cur_tools]:
+              fields = []
+              for field in ("description", "parameters", "strict"):
+                  if canon(cur_tools[name].get(field)) != canon(cand_tools[name].get(field)):
+                      fields.append(field)
+              if fields:
+                  changed.append((name, fields))
+
+          common = set(cur_tools) & set(cand_tools)
+          order_changed = [n for n in cur_order if n in common] != [n for n in cand_order if n in common]
+
+          tool_count = len(cand_tools)
+          cur_prompt_bytes = int(cur_meta.get("bytes") or 0)
+          prompt_bytes = len(cand_prompt.encode("utf-8"))
+          prompt_changed = (cur_meta.get("sha256") or "") != sha_cand_prompt
+          # 契约 §3.5：prompt 只做告警，不参与 DRIFT 判定，也绝不自动替换。
+          # 抓包场景（裸仓库、最小 prompt）与生产注入场景不同构：实测 2026-11-17
+          # 干净 runner 抓到 8012 字节，而生产注入的是 94858 字节——直接替换等于
+          # 把 87KB 的正文删掉，是把好资产改坏的典型路径。
+          prompt_ratio = (prompt_bytes / cur_prompt_bytes) if cur_prompt_bytes else 0.0
+          prompt_scenario_mismatch = prompt_ratio < 0.5 or prompt_ratio > 2.0
+          drift = bool(added or removed or changed or order_changed)
+
+          def fmt_names(names):
+              return ", ".join(f"`{n}`" for n in names) if names else "—"
+
+          diff_lines = []
+          diff_lines.append(f"- 新增工具 ({len(added)}): {fmt_names(added)}")
+          diff_lines.append(f"- 删除工具 ({len(removed)}): {fmt_names(removed)}")
+          if changed:
+              detail = ", ".join(f"`{n}`({', '.join(f)})" for n, f in changed)
+              diff_lines.append(f"- 改动工具 ({len(changed)}): {detail}")
+          else:
+              diff_lines.append("- 改动工具 (0): —")
+          diff_lines.append(f"- order 顺序变化: {'是' if order_changed else '否'}")
+          diff_lines.append(
+              f"- prompt: {'变化' if prompt_changed else '无变化'}"
+              f"（{cur_prompt_bytes} -> {prompt_bytes} 字节）"
+          )
+          diff_summary = "\n".join(diff_lines)
+
+          summary = "\n".join(
+              [
+                  "### refresh-assets canonical diff",
+                  "",
+                  f"- state: **{'DRIFT' if drift else 'NO_DRIFT'}**",
+                  f"- CLI 版本: `{cur.get('cli_version')}` -> `{cand.get('cli_version')}`",
+                  f"- 工具数: {len(cur_tools)} -> {tool_count}",
+                  f"- prompt 字节数: {cur_prompt_bytes} -> {prompt_bytes}",
+                  f"- official_tools.json canonical sha256 (order+tools): `{sha_cur}` -> `{sha_cand}`",
+                  f"- prompt.txt sha256 (rstrip 后补单个 LF，与 prompt_bytes 同口径): `{sha_cur_prompt}` -> `{sha_cand_prompt}`",
+                  "",
+                  diff_summary,
+                  "",
+              ]
+          )
+          print(summary)
+
+          pr_body = "\n".join(
+              [
+                  f"由 `refresh-assets` 自动生成，run: {run_url}",
+                  "",
+                  "## 变化",
+                  "",
+                  f"- CLI 版本: `{cur.get('cli_version')}` -> `{cand.get('cli_version')}`",
+                  f"- 工具数: {len(cur_tools)} -> {tool_count}",
+                  f"- prompt 字节数: {cur_prompt_bytes} -> {prompt_bytes}",
+                  "",
+                  "## canonical sha256",
+                  "",
+                  "| 对象 | 当前 assets/ | 本次 candidate |",
+                  "|---|---|---|",
+                  f"| `official_tools.json`（order+tools，canonical json） | `{sha_cur}` | `{sha_cand}` |",
+                  f"| `prompt.txt`（rstrip 后补单个 LF 的 sha256） | `{sha_cur_prompt}` | `{sha_cand_prompt}` |",
+                  f"| `source.sha256`（仅 tools 对象，契约字段） | — | `{sha_cand_tools}` |",
+                  "",
+                  "## 逐字段 diff 摘要",
+                  "",
+                  diff_summary,
+                  "",
+                  "## 检查",
+                  "",
+                  "- [x] `validate_assets.py` 通过",
+                  "- [x] 脱敏门禁通过（Bearer / ses_ / ghp_ / sk- / 24-hex 全无命中）",
+                  "- [x] 原始 captures 未上传 artifact，仅 `assets_candidate`（即 `_cap/candidate`）",
+                  "",
+                  "> 合并即改变网关 vendor 的上游特征，请先确认 diff 合理。",
+                  "",
+              ]
+          )
+          (W / "pr_body.md").write_text(pr_body, encoding="utf-8")
+          (W / "diff_summary.md").write_text(diff_summary + "\n", encoding="utf-8")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"STATE={'DRIFT' if drift else 'NO_DRIFT'}\n")
+              handle.write(f"TOOL_COUNT={tool_count}\n")
+              handle.write(f"PROMPT_BYTES={prompt_bytes}\n")
+              handle.write(f"SHA_TOOLS={sha_cand}\n")
+              handle.write(f"SHA_PROMPT={sha_cand_prompt}\n")
+              handle.write(f"DRIFT_TOOLS={len(added)}+{len(removed)}+{len(changed)}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(summary + "\n")
+
+          print(f"canonical sha256 (candidate) official_tools={sha_cand} prompt={sha_cand_prompt}")
+          print("STATE=" + ("DRIFT" if drift else "NO_DRIFT"))
+          PY
+
+      - name: "NO_CAPTURE / EXTRACT_FAIL: open issue and fail the run"
+        if: env.STATE == 'NO_CAPTURE' || env.STATE == 'EXTRACT_FAIL'
+        run: |
+          set -euo pipefail
+          if [ "$STATE" = "NO_CAPTURE" ]; then
+            LABEL="no-capture"
+            TITLE="[no-capture] refresh-assets: CLI 没有产生可用候选请求 (run $GITHUB_RUN_ID)"
+          else
+            LABEL="extract-fail"
+            TITLE="[extract-fail] refresh-assets: 抽取/校验/脱敏失败 (run $GITHUB_RUN_ID)"
+          fi
+          gh label create no-capture --color B60205 --description "CLI capture produced no usable candidate request" --force || true
+          gh label create extract-fail --color D93F0B --description "extract_assets / validate_assets / redaction failed on a candidate" --force || true
+          {
+            echo "## refresh-assets: $STATE"
+            echo
+            echo "- run: $RUN_URL"
+            echo "- state: \`$STATE\`"
+            echo "- cli: \`${CLI_VER:-unknown}\`"
+            echo "- captured requests: \`${BODY_COUNT:-0}\`"
+            echo "- extract exit: \`${EXTRACT_EXIT:-n/a}\`, validate exit: \`${VALIDATE_EXIT:-n/a}\`, redaction exit: \`${REDACT_EXIT:-n/a}\`"
+            echo "- reason: ${FAIL_REASON:-见下方日志}"
+            echo
+            echo "### cli.stderr（尾部）"
+            echo '```'
+            tail -25 "$W/cli.err" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "### extract_assets.py（尾部）"
+            echo '```'
+            tail -40 "$W/extract.out" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "### validate_assets.py（尾部）"
+            echo '```'
+            tail -30 "$W/validate.out" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "### redaction gate"
+            echo '```'
+            tail -20 "$W/redact.out" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "### sink.log（尾部）"
+            echo '```'
+            tail -20 "$W/sink.log" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "原始 captures 未上传 artifact（只上传 \`assets_candidate\`）。"
+          } > "$W/issue_body.md"
+          ISSUE_URL="$(gh issue create --title "$TITLE" --body-file "$W/issue_body.md" --label "$LABEL")"
+          echo "ISSUE_URL=$ISSUE_URL" >> "$GITHUB_ENV"
+          {
+            echo "### refresh-assets: $STATE"
+            echo
+            echo "- run: $RUN_URL"
+            echo "- issue: $ISSUE_URL"
+            echo "- reason: ${FAIL_REASON:-见 issue}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$STATE: issue 已开：$ISSUE_URL"
+          exit 1
+
+      - name: "DRIFT: push asset-drift branch and open PR"
+        if: env.STATE == 'DRIFT'
+        run: |
+          set -euo pipefail
+          # 固定分支名：每天漂移复用同一个分支与同一个 PR，避免 PR 刷屏。
+          # 每次 run 用 --force-with-lease 覆盖，PR 自动更新；run 链接写在 PR body 里。
+          BRANCH="asset-drift/latest"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          mkdir -p assets
+          cp "$W/candidate/official_tools.json" assets/official_tools.json
+          # 契约 §8（public runner）：本仓库不存 prompt 全文，只存 sha/字节数摘要。
+          # 全文留在私有仓库 zen-assets；这里写入摘要，让「prompt 有没有变」在公开
+          # 的 git 历史里可见，同时不泄漏内容。
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib
+
+          candidate = pathlib.Path(os.environ["W"]) / "candidate" / "prompt.txt"
+          blob = candidate.read_bytes()
+          meta_path = pathlib.Path("assets/prompt-meta.json")
+          previous = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+          meta = {
+              "sha256": hashlib.sha256(blob).hexdigest(),
+              "bytes": len(blob),
+              "chars": len(blob.decode("utf-8")),
+              "cli_version": os.environ.get("CLI_VER", previous.get("cli_version", "")),
+              "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "previous_sha256": previous.get("sha256"),
+              "previous_bytes": previous.get("bytes"),
+              "note": "public runner 只存摘要，全文在私有仓库 zen-assets（契约 §8）",
+          }
+          meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print("prompt-meta: %s -> %s bytes" % (meta.get("previous_bytes"), meta["bytes"]))
+          PY
+          # 回填 source 溯源字段（extract 只知道 cli 版本，不知道 run 链接）
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          path = pathlib.Path("assets/official_tools.json")
+          doc = json.loads(path.read_text(encoding="utf-8"))
+          source = doc.get("source") or {}
+          source["workflow"] = "refresh-assets"
+          source["run_url"] = os.environ.get("RUN_URL") or None
+          doc["source"] = source
+          path.write_text(
+              json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
+              encoding="utf-8",
+          )
+          print("source.run_url ->", source["run_url"])
+          PY
+          # 第 3 层脱敏：提交前对整个 assets/ 再扫一遍，命中即 fail
+          python3 - "$GITHUB_WORKSPACE/assets" >"$W/redact_assets.out" 2>&1 <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          # 与 candidate 门禁同一套模式（左边界 + 最小 token 长度；24-hex 前后边界）
+          GUARD = r"(?<![A-Za-z0-9_])"
+          PATTERNS = [
+              ("Bearer ", re.compile(GUARD + r"Bearer ")),
+              ("ses_", re.compile(GUARD + r"ses_[A-Za-z0-9]{8,}")),
+              ("ghp_", re.compile(GUARD + r"ghp_[A-Za-z0-9]{16,}")),
+              ("sk-", re.compile(GUARD + r"sk-[A-Za-z0-9_-]{10,}")),
+              ("[0-9a-f]{24}", re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{24}(?![0-9a-fA-F])")),
+          ]
+
+          hits = 0
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for lineno, line in enumerate(text.splitlines(), 1):
+                  for label, pattern in PATTERNS:
+                      if pattern.search(line):
+                          hits += 1
+                          print(f"HIT {path}:{lineno} pattern={label}")
+          print("redaction gate on assets/: " + ("FAILED" if hits else "clean"))
+          sys.exit(1 if hits else 0)
+          PY
+          cat "$W/redact_assets.out"
+          echo "assets/ 脱敏门禁通过"
+          git add assets/official_tools.json assets/prompt-meta.json
+          if git diff --cached --quiet; then
+            echo "NO_DRIFT"
+            echo "STATE=NO_DRIFT" >> "$GITHUB_ENV"
+            {
+              echo "### refresh-assets: NO_DRIFT"
+              echo
+              echo "canonical 上有差异但 staging 后无差异（仅 volatile 字段变化），不开 PR。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "chore(assets): refresh from upstream CLI ${CLI_VER}"
+          # 该分支只由本流水线写，且每轮整体覆盖，故用 --force。
+          # （--force-with-lease 在 checkout 后本地没有该分支的 remote-tracking 引用，
+          #   会以 "stale info" 被拒——2026-11-17 run 44044236258 实测。）
+          git push --force origin "$BRANCH"
+          gh label create asset-drift --color 0E8A16 --description "上游资产漂移（refresh-assets 自动开 PR）" --force || true
+
+          # 固定分支 -> 已存在的开放 PR 直接改内容，不新建；没有才创建。
+          EXISTING_PR="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING_PR" ]; then
+            gh pr edit "$EXISTING_PR" --body-file "$W/pr_body.md"
+            PR_URL="$(gh pr view "$EXISTING_PR" --json url --jq .url)"
+            echo "复用已有 PR #$EXISTING_PR"
+          else
+            PR_URL="$(gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(assets): asset drift from CLI ${CLI_VER}" \
+              --body-file "$W/pr_body.md" \
+              --label asset-drift)"
+          fi
+          echo "PR_URL=$PR_URL" >> "$GITHUB_ENV"
+
+          # GITHUB_TOKEN 推的提交不会自动触发 pull_request 工作流（run 会停在
+          # action_required），必须显式派发一次 ci，否则 PR 的闸门永远不跑。
+          gh workflow run ci.yml --ref "$BRANCH" || echo "warn: 派发 ci 失败，需人工在 PR 上点运行"
+
+          {
+            echo "### refresh-assets: DRIFT"
+            echo
+            echo "- PR: $PR_URL"
+            echo "- branch: \`$BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "DRIFT: PR 已开：$PR_URL"
+
+      # 契约 §8：public 仓库的 artifact 任何人可下载，所以**绝不能**上传 candidate
+      # （里面有 prompt.txt 全文）。只上传不含正文的元数据。
+      - name: Upload metadata artifact (不含 prompt 正文)
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/meta"
+          if [ -f "$W/extract-report.json" ]; then cp "$W/extract-report.json" "$W/meta/"; fi
+          if [ -f "$W/candidate/official_tools.json" ]; then cp "$W/candidate/official_tools.json" "$W/meta/"; fi
+          if [ -f "$W/candidate/prompt.txt" ]; then
+            sha256sum "$W/candidate/prompt.txt" | awk '{print $1}' > "$W/meta/prompt.sha256"
+          fi
+          ls -la "$W/meta"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: assets_metadata
+          path: ${{ env.W }}/meta
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Step summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          W = pathlib.Path(os.environ["W"])
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+
+          def env(name, default="n/a"):
+              value = os.environ.get(name, "").strip()
+              return value if value else default
+
+          # 候选条数 / 被排除请求原因计数：extract_assets.py 若产出机器可读报告则读之，
+          # 否则如实标 n/a（本次契约里没有 --report 参数，见回报的契约缺口）。
+          report = None
+          candidates = None
+          reasons = None
+          for path in sorted(W.glob("**/*report*.json")) + sorted(W.glob("**/*stats*.json")):
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  continue
+              if isinstance(data, dict) and ("candidates" in data or "excluded" in data or "reasons" in data):
+                  report = path
+                  raw = data.get("candidates")
+                  if isinstance(raw, list):
+                      candidates = len(raw)
+                  elif isinstance(raw, int):
+                      candidates = raw
+                  reasons = data.get("excluded") or data.get("reasons")
+                  break
+
+          lines = [
+              "### refresh-assets 汇总",
+              "",
+              f"- state: **{env('STATE')}**",
+              f"- CLI 版本: `{env('CLI_VER')}`",
+              f"- 工具数: `{env('TOOL_COUNT', 'n/a')}`",
+              f"- prompt 字节数: `{env('PROMPT_BYTES', 'n/a')}`",
+              f"- canonical sha256: `official_tools.json`={env('SHA_TOOLS')} / `prompt.txt`={env('SHA_PROMPT')}",
+              f"- 候选条数: `{candidates if candidates is not None else 'n/a'}`",
+          ]
+          if isinstance(reasons, dict) and reasons:
+              rendered = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
+              lines.append(f"- 被排除请求原因计数: {rendered}")
+          elif reasons:
+              lines.append(f"- 被排除请求原因计数: {reasons}")
+          else:
+              lines.append("- 被排除请求原因计数: n/a（extract_assets.py 未产出报告文件）")
+          lines.append(f"- 抓到的原始请求数: `{env('BODY_COUNT', '0')}`")
+          lines.append(f"- 退出码：extract={env('EXTRACT_EXIT')} / validate={env('VALIDATE_EXIT')} / redaction={env('REDACT_EXIT')}")
+          if report is not None:
+              lines.append(f"- 报告文件: `{report}`")
+          if os.environ.get("PR_URL"):
+              lines.append(f"- PR: {os.environ['PR_URL']}")
+          if os.environ.get("ISSUE_URL"):
+              lines.append(f"- issue: {os.environ['ISSUE_URL']}")
+          lines.append("")
+
+          with open(summary_path, "a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+          if [ "${STATE:-}" = "NO_DRIFT" ]; then
+            echo "NO_DRIFT"
+          fi
