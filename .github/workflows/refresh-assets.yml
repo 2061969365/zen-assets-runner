@@ -715,6 +715,9 @@ jobs:
       - name: Dispatch asset-e2e on zen-direct-v2 and report back
         if: env.PR_URL != '' && env.VERIFY_E2E == 'true'
         continue-on-error: true
+        env:
+          # secret 必须显式映射成 env 才能读到；只在默认分支的工作流里可用
+          ASSETS_E2E_TOKEN: ${{ secrets.ASSETS_E2E_TOKEN }}
         run: |
           set -uo pipefail
           TOKEN="${ASSETS_E2E_TOKEN:-}"
