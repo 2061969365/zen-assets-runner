@@ -118,7 +118,8 @@ jobs:
           ./sing-box version | head -2
           curl -fsSL --retry 3 -o vpngate_to_singbox.py \
             "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py"
-          python3 tools/vpngate_pick.py
+          # 脚本按 cwd 找 nodes.csv/sing-box，所以这里 cat 之前必须还在 $W/vp
+          python3 "$GITHUB_WORKSPACE/tools/vpngate_pick.py"
           cat "$W/vp/proxy.env" >> "$GITHUB_ENV"
           echo "vpngate 出口就绪"
 
