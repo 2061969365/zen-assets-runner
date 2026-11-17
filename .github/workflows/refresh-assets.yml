@@ -49,7 +49,10 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 -> 25：新增的「形态探测」阶段自身有 SHAPE_BUDGET(540s) + 单形态 SHAPE_TIMEOUT(180s)
+    # 的上界，叠加主抓包 240s 与出口验收 180s，15 分钟在最坏情况下会先撞 job timeout，
+    # 那样连 artifact 和 step summary 都写不出来。这里只是给上界留余量，不改变任何步骤行为。
+    timeout-minutes: 25
     env:
       W: ${{ github.workspace }}/_cap
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -264,6 +267,399 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "extract_exit=$EXTRACT_EXIT candidate_ok=$CANDIDATE_OK report_status=$REPORT_STATUS state=$STATE"
           tail -40 "$W/extract.out" || true
+
+      # ---------- 抓包多样化（只采元数据，绝不采集/上传 body）----------
+      # 主抓包只有一种形态（一句 "Reply with the single word: ok"），所以它只能回答
+      # 「这一个形态下 CLI 发什么」。工具集会不会随任务/agent 形态变化，必须换几种
+      # 形态各抓一次才知道。
+      # 隔离：独立 sink（端口 19101，输出 $W/shapes/bodies）。主 sink 的 $W/bodies 是
+      # extract 的输入，往里多塞请求就会改掉候选选择，所以这里绝不复用同一个 sink。
+      # 容错：这是探测步骤，任何一个形态失败都只记一行 skipped/failed，
+      # 内部兜底 + continue-on-error 双保险，绝不让 refresh 流程失败。
+      - name: "Probe request shapes on an isolated sink (metadata only)"
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          SHAPES="$W/shapes"
+          SHAPES_PORT=19101
+          SHAPE_TIMEOUT="${SHAPE_TIMEOUT:-180}"
+          SHAPE_BUDGET="${SHAPE_BUDGET:-540}"
+          SHAPES_CFG='{"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:19101/inference/v1"}}}}'
+          mkdir -p "$SHAPES/bodies" "$SHAPES/results"
+          T0=$(date +%s)
+
+          # 兜底 1：先把 matrix.json 写成「全部未执行」。即使本步骤被中途掐断（job timeout /
+          # cancel / python 崩），artifact 里也有一个结构完整的 matrix.json。
+          python3 - "$SHAPES/matrix.json" <<'PY'
+          import json
+          import sys
+
+          names = ["baseline_exact", "task_read_file", "agent_plan"]
+          payload = {
+              "workflow": "refresh-assets",
+              "stage": "shapes",
+              "baseline": "baseline_exact",
+              "baseline_names_sha": None,
+              "note": "只有元数据（名字/数量/sha），不含任何 prompt 正文",
+              "shapes": [
+                  {
+                      "shape": name,
+                      "status": "skipped",
+                      "reason": "未执行（步骤提前结束或被跳过）",
+                      "exit": None,
+                      "bodies": 0,
+                      "bodies_with_tools": 0,
+                      "tools": 0,
+                      "names_sha": None,
+                      "names": [],
+                  }
+                  for name in names
+              ],
+          }
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, ensure_ascii=False, indent=2)
+              handle.write("\n")
+          print("matrix.json 兜底骨架 ->", sys.argv[1])
+          PY
+
+          # 独立 sink
+          SHAPES_SINK_PID=""
+          python3 tools/sink.py --port "$SHAPES_PORT" --out "$SHAPES/bodies" \
+            >"$SHAPES/sink.log" 2>&1 &
+          SHAPES_SINK_PID=$!
+          trap 'if [ -n "${SHAPES_SINK_PID:-}" ]; then kill "$SHAPES_SINK_PID" 2>/dev/null || true; fi' EXIT
+          python3 - "$SHAPES_PORT" <<'PY'
+          import socket
+          import sys
+          import time
+
+          port = int(sys.argv[1])
+          deadline = time.time() + 30
+          while time.time() < deadline:
+              try:
+                  with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                      print("shapes sink ready on 127.0.0.1:{0}".format(port))
+                      sys.exit(0)
+              except OSError:
+                  time.sleep(0.2)
+          exit(1)
+          PY
+          if [ $? -ne 0 ]; then
+            echo "::warning::shapes sink 起不来（端口 $SHAPES_PORT），全部形态记 skipped；主流程不受影响"
+            cat "$SHAPES/sink.log" 2>/dev/null || true
+            SINK_OK=0
+          else
+            SINK_OK=1
+          fi
+
+          # 先探测 CLI 支持哪些形态参数，探测不到就跳过对应形态并记 skipped
+          HAS_AGENT=0
+          HAS_AGENT_PLAN=0
+          opencode --help >"$SHAPES/help.txt" 2>&1 || true
+          opencode run --help >"$SHAPES/run-help.txt" 2>&1 || true
+          if grep -qF -e '--agent' "$SHAPES/run-help.txt" 2>/dev/null; then HAS_AGENT=1; fi
+          if [ "$HAS_AGENT" = "1" ] && grep -qi 'plan' "$SHAPES/run-help.txt" 2>/dev/null; then HAS_AGENT_PLAN=1; fi
+          echo "probe: --agent=$HAS_AGENT agent_plan=$HAS_AGENT_PLAN"
+
+          budget_left() {
+            [ $(( $(date +%s) - T0 )) -lt "$SHAPE_BUDGET" ]
+          }
+
+          record_skip() {
+            python3 - "$SHAPES/results" "$1" "$2" <<'PY'
+          import json
+          import os
+          import sys
+
+          out_dir, name, reason = sys.argv[1], sys.argv[2], sys.argv[3]
+          payload = {
+              "shape": name,
+              "status": "skipped",
+              "reason": reason,
+              "exit": None,
+              "bodies": 0,
+              "bodies_with_tools": 0,
+              "tools": 0,
+              "names_sha": None,
+              "names": [],
+          }
+          with open(os.path.join(out_dir, name + ".json"), "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, ensure_ascii=False, indent=2)
+              handle.write("\n")
+          print("shape={0} skipped: {1}".format(name, reason))
+          PY
+          }
+
+          run_shape() {
+            name="$1"
+            shift
+            start_ts="$(python3 -c 'import time; print(repr(time.time()))')"
+            # 形态内部再兜一层：sink 只回一个最小 SSE，CLI 的退出码不作为判据
+            OPENCODE_CONFIG_CONTENT="$SHAPES_CFG" \
+              timeout --signal=TERM --kill-after=15 "$SHAPE_TIMEOUT" \
+                opencode run -m opencode/deepseek-v4.1-flash-free "$@" \
+                >"$SHAPES/$name.out" 2>"$SHAPES/$name.err"
+            exit_code=$?
+            echo "shape=$name exit=$exit_code"
+            tail -3 "$SHAPES/$name.err" 2>/dev/null || true
+            python3 - "$SHAPES/bodies" "$start_ts" "$SHAPES/results/$name.json" "$name" "$exit_code" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          bodies_dir, start_ts, out_path, name, exit_code = sys.argv[1:6]
+          start = float(start_ts)
+          bodies = 0
+          with_tools = 0
+          best = 0
+          names = []
+          # 只认本形态产生的记录：sink 每条都写 ts，按时间切分，不会串到别的形态
+          for path in sorted(pathlib.Path(bodies_dir).glob("*.json")):
+              try:
+                  record = json.loads(path.read_text(encoding="utf-8"))
+              except Exception:
+                  continue
+              if float(record.get("ts") or 0) < start:
+                  continue
+              bodies += 1
+              body = record.get("body")
+              if isinstance(body, str):
+                  try:
+                      body = json.loads(body)
+                  except Exception:
+                      body = None
+              if not isinstance(body, dict):
+                  continue
+              tools = body.get("tools")
+              if not isinstance(tools, list):
+                  continue
+              with_tools += 1
+              if len(tools) > best:
+                  best = len(tools)
+                  names = []
+                  for entry in tools:
+                      inner = entry.get("function") if isinstance(entry, dict) else None
+                      source = inner if isinstance(inner, dict) else entry
+                      tool_name = source.get("name") if isinstance(source, dict) else None
+                      if isinstance(tool_name, str) and tool_name.strip():
+                          names.append(tool_name.strip())
+          unique = sorted(set(names))
+          payload = {
+              "shape": name,
+              # 抓到 0 条就老实写 empty：matrix 里一眼能看出「这条形态没采到东西」，
+              # 不会被当成「采到了但工具集是空的」。
+              "status": "captured" if bodies else "empty",
+              "reason": "" if bodies else "sink 没收到请求（CLI exit={0}）".format(exit_code),
+              "exit": int(exit_code),
+              "bodies": bodies,
+              "bodies_with_tools": with_tools,
+              "tools": best,
+              "names_sha": hashlib.sha256("\n".join(unique).encode("utf-8")).hexdigest() if unique else None,
+              "names": unique,
+          }
+          pathlib.Path(out_path).write_text(
+              json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+          )
+          print("shape={0} bodies={1} tools={2} names_sha={3}".format(
+              name, bodies, best, payload["names_sha"]))
+          PY
+          }
+
+          if [ "$SINK_OK" = "1" ]; then
+            # 形态 1：与主抓包同一句 prompt（基线，应当与主抓包一致）
+            if budget_left; then
+              run_shape baseline_exact "Reply with the single word: ok"
+            else
+              record_skip baseline_exact "形态预算用尽（SHAPE_BUDGET=$SHAPE_BUDGET）"
+            fi
+
+            # 形态 2：长得完全不同的任务（要求列目录 + 读文件），看工具集是否随任务变化
+            if budget_left; then
+              run_shape task_read_file "Run ls -la to list the current directory, read README.md, then summarize this repository in three sentences."
+            else
+              record_skip task_read_file "形态预算用尽（SHAPE_BUDGET=$SHAPE_BUDGET）"
+            fi
+
+            # 形态 3：agent/plan 形态；CLI 不支持就明确记 skipped，不假装跑过
+            if [ "$HAS_AGENT" != "1" ]; then
+              record_skip agent_plan "opencode run --help 未提供 --agent"
+            elif [ "$HAS_AGENT_PLAN" != "1" ]; then
+              record_skip agent_plan "有 --agent 但帮助里没有 plan 形态"
+            elif ! budget_left; then
+              record_skip agent_plan "形态预算用尽（SHAPE_BUDGET=$SHAPE_BUDGET）"
+            else
+              run_shape agent_plan --agent plan "Plan how you would rename a function in tools/sink.py. Do not edit any file."
+            fi
+          else
+            record_skip baseline_exact "shapes sink 未就绪（端口 $SHAPES_PORT）"
+            record_skip task_read_file "shapes sink 未就绪（端口 $SHAPES_PORT）"
+            record_skip agent_plan "shapes sink 未就绪（端口 $SHAPES_PORT）"
+          fi
+
+          if [ -n "$SHAPES_SINK_PID" ]; then
+            kill "$SHAPES_SINK_PID" 2>/dev/null || true
+            SHAPES_SINK_PID=""
+          fi
+
+          # 兜底 2：汇总。缺结果文件的一律按 skipped 补行，任何 shape 失败都不影响退出码。
+          python3 - "$SHAPES" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          shapes_dir = pathlib.Path(sys.argv[1])
+          summary_path = sys.argv[2]
+          order = ["baseline_exact", "task_read_file", "agent_plan"]
+          note = {
+              "baseline_exact": "与主抓包同一句 prompt（应与主抓包一致）",
+              "task_read_file": "换任务：列目录 + 读 README.md",
+              "agent_plan": "agent/plan 形态（--agent plan）",
+          }
+
+          results = []
+          for name in order:
+              path = shapes_dir / "results" / (name + ".json")
+              value = None
+              if path.is_file():
+                  try:
+                      value = json.loads(path.read_text(encoding="utf-8"))
+                  except Exception:
+                      value = None
+              if not isinstance(value, dict):
+                  value = {
+                      "shape": name,
+                      "status": "skipped",
+                      "reason": "没有产出结果（sink 未就绪或步骤提前结束）",
+                      "exit": None,
+                      "bodies": 0,
+                      "bodies_with_tools": 0,
+                      "tools": 0,
+                      "names_sha": None,
+                      "names": [],
+                  }
+              results.append(value)
+
+          baseline_sha = None
+          for item in results:
+              if item.get("shape") == "baseline_exact" and item.get("names_sha"):
+                  baseline_sha = item["names_sha"]
+                  break
+
+          shapes = []
+          for item in results:
+              sha = item.get("names_sha")
+              if item.get("status") != "captured" or baseline_sha is None:
+                  consistent = None
+              elif item.get("shape") == "baseline_exact":
+                  consistent = True
+              else:
+                  consistent = sha == baseline_sha
+              shapes.append(
+                  {
+                      "shape": item.get("shape"),
+                      "status": item.get("status"),
+                      "reason": item.get("reason") or "",
+                      "exit": item.get("exit"),
+                      "bodies": item.get("bodies", 0),
+                      "bodies_with_tools": item.get("bodies_with_tools", 0),
+                      "tools": item.get("tools", 0),
+                      "names_sha": sha,
+                      "names": item.get("names") or [],
+                      "consistent_with_baseline": consistent,
+                  }
+              )
+
+          matrix = {
+              "workflow": "refresh-assets",
+              "stage": "shapes",
+              "baseline": "baseline_exact",
+              "baseline_names_sha": baseline_sha,
+              "note": "只有元数据（名字/数量/sha），不含任何 prompt 正文",
+              "shapes": shapes,
+          }
+          (shapes_dir / "matrix.json").write_text(
+              json.dumps(matrix, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+          )
+
+          def clean(value):
+              return str(value).replace("|", "\\|").replace("\n", " ")
+
+          lines = [
+              "",
+              "### 抓包形态矩阵（独立 sink `{0}`，仅元数据）".format(shapes_dir),
+              "",
+              "| shape | exit | bodies | tools | names_sha | 与基线一致 |",
+              "|---|---|---|---|---|---|",
+          ]
+          details = []
+          captured_any = False
+          for item in shapes:
+              if item["status"] == "empty":
+                  lines.append(
+                      "| `{0}` | {1} | 0 | 0 | — | empty: {2} |".format(
+                          item["shape"], item["exit"], clean(item["reason"] or "没抓到 body")
+                      )
+                  )
+                  continue
+              if item["status"] != "captured":
+                  lines.append(
+                      "| `{0}` | — | — | — | — | skipped: {1} |".format(
+                          item["shape"], clean(item["reason"] or item["status"])
+                      )
+                  )
+                  continue
+              captured_any = True
+              if item["shape"] == "baseline_exact":
+                  same = "基线"
+              elif item["consistent_with_baseline"] is True:
+                  same = "是"
+              elif item["consistent_with_baseline"] is False:
+                  same = "**否**"
+              else:
+                  same = "n/a"
+              sha = item["names_sha"] or "n/a"
+              lines.append(
+                  "| `{0}` | {1} | {2} | {3} | `{4}` | {5} |".format(
+                      item["shape"],
+                      item["exit"],
+                      item["bodies"],
+                      item["tools"],
+                      sha[:12],
+                      same,
+                  )
+              )
+              details.append(
+                  "- `{0}`：{1}；工具名 {2} 个：{3}".format(
+                      item["shape"],
+                      note.get(item["shape"], ""),
+                      len(item["names"]),
+                      ", ".join("`{0}`".format(n) for n in item["names"]) or "—",
+                  )
+              )
+          if not captured_any:
+              lines.append("")
+              lines.append(
+                  "所有形态都没抓到 body：见上方日志与 `$W/shapes/sink.log`。"
+                  "主抓包、提取、脱敏、PR 流程完全不受影响（本步骤 continue-on-error）。"
+              )
+          if details:
+              lines.append("")
+              lines.append("<details><summary>各形态工具名集合</summary>")
+              lines.append("")
+              lines.extend(details)
+              lines.append("")
+              lines.append("</details>")
+          lines.append("")
+
+          with open(summary_path, "a", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
+          # 兜底 3：无论如何都以 0 退出（探测失败不是 refresh 失败）
+          exit 0
 
       - name: Validate candidate assets
         if: env.STATE == 'PENDING'
@@ -515,6 +911,97 @@ jobs:
           print(f"canonical sha256 (candidate) official_tools={sha_cand} prompt={sha_cand_prompt}")
           print("STATE=" + ("DRIFT" if drift else "NO_DRIFT"))
           PY
+
+      # ---------- 语义 diff（依赖并行交付的 tools/schema_diff.py）----------
+      # canonical diff 只回答「变了没」；这一条回答「哪个路径从什么变成什么」。
+      # 接口按约定调用（脚本可能还没落盘，故先 test -f）：
+      #   python tools/schema_diff.py --old <旧>/official_tools.json --new <新>/official_tools.json \
+      #       --out <json> --markdown        # exit 0 无变化 / 1 有变化 / 2 出错（--markdown 时 stdout 人读版）
+      # 缺失或出错一律降级成 ::warning::：这一步是增强信息，不许把整条 refresh 流程弄挂。
+      - name: "Semantic diff via tools/schema_diff.py (warning-only)"
+        if: env.STATE == 'DRIFT' || env.STATE == 'NO_DRIFT'
+        run: |
+          set -euo pipefail
+          # 与上一步 canonical diff 的 cur_dir / cand_dir 是同一对目录，只是显式落成变量：
+          #   cur_dir  = $GITHUB_WORKSPACE/assets（公开仓库里的权威副本）
+          #   cand_dir = $W/candidate（本轮候选）
+          CUR_DIR="$GITHUB_WORKSPACE/assets"
+          CAND_DIR="$W/candidate"
+          SCRIPT="tools/schema_diff.py"
+          SD_JSON="$W/schema_diff.json"
+          SD_MD="$W/schema_diff.md"
+          SD_EXIT=""
+          SD_STATUS="skipped"
+          SD_REASON=""
+          rm -f "$SD_JSON" "$SD_MD"
+          if [ ! -f "$SCRIPT" ]; then
+            SD_REASON="tools/schema_diff.py 尚未落盘（并行交付中），跳过语义 diff"
+          elif [ ! -s "$CUR_DIR/official_tools.json" ] || [ ! -s "$CAND_DIR/official_tools.json" ]; then
+            SD_REASON="official_tools.json 缺失或为空，跳过语义 diff"
+          else
+            echo "old=$CUR_DIR/official_tools.json"
+            echo "new=$CAND_DIR/official_tools.json"
+            set +e
+            python3 "$SCRIPT" \
+              --old "$CUR_DIR/official_tools.json" \
+              --new "$CAND_DIR/official_tools.json" \
+              --out "$SD_JSON" \
+              --markdown \
+              >"$SD_MD" 2>"$W/schema_diff.err"
+            SD_EXIT=$?
+            set -e
+            case "$SD_EXIT" in
+              0) SD_STATUS="unchanged" ;;
+              1) SD_STATUS="changed" ;;
+              2) SD_STATUS="error"; SD_REASON="schema_diff.py exit=2（脚本自报出错），按 warning 处理" ;;
+              *) SD_STATUS="error"; SD_REASON="schema_diff.py exit=$SD_EXIT（非约定退出码），按 warning 处理" ;;
+            esac
+            echo "schema_diff exit=$SD_EXIT status=$SD_STATUS"
+            tail -8 "$W/schema_diff.err" 2>/dev/null || true
+          fi
+          if [ -n "$SD_REASON" ]; then
+            echo "::warning::$SD_REASON"
+          fi
+          # 出错时脚本可能留下半截 json：解析不过就丢掉，残缺文件绝不上传
+          if [ "$SD_STATUS" = "error" ]; then
+            if [ -f "$SD_JSON" ] && ! python3 -c 'import json,sys;json.load(open(sys.argv[1],encoding="utf-8"))' "$SD_JSON" 2>/dev/null; then
+              rm -f "$SD_JSON"
+            fi
+            rm -f "$SD_MD"
+          fi
+          # summary：包在 <details> 里，避免十几行 diff 刷屏
+          {
+            echo ""
+            echo "<details><summary>语义 diff（tools/schema_diff.py）: $SD_STATUS</summary>"
+            echo ""
+            if [ -s "$SD_MD" ]; then
+              cat "$SD_MD"
+            else
+              echo "_无可展示内容：${SD_REASON}_"
+            fi
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 有变化时把 markdown 追加进 PR body：让 PR 自己带「哪个路径从什么变成什么」
+          if [ "$SD_STATUS" = "changed" ] && [ -s "$W/pr_body.md" ] && [ -s "$SD_MD" ]; then
+            {
+              echo ""
+              echo "## 语义 diff（tools/schema_diff.py）"
+              echo ""
+              echo "<details><summary>逐路径变化（展开看）</summary>"
+              echo ""
+              cat "$SD_MD"
+              echo ""
+              echo "</details>"
+              echo ""
+            } >> "$W/pr_body.md"
+            echo "PR body 已追加语义 diff（$SD_MD）"
+          fi
+          {
+            echo "SCHEMA_DIFF_STATUS=$SD_STATUS"
+            echo "SCHEMA_DIFF_EXIT=${SD_EXIT:-n/a}"
+          } >> "$GITHUB_ENV"
+          echo "schema_diff: status=$SD_STATUS exit=${SD_EXIT:-n/a}"
 
       - name: "NO_CAPTURE / EXTRACT_FAIL: open issue and fail the run"
         if: env.STATE == 'NO_CAPTURE' || env.STATE == 'EXTRACT_FAIL'
@@ -794,6 +1281,105 @@ jobs:
         with:
           name: assets_metadata
           path: ${{ env.W }}/meta
+          if-no-files-found: warn
+          retention-days: 7
+
+      # schema_diff.json（纯结构 diff）与 shapes/matrix.json（只有工具名/数量/sha）都是
+      # 元数据，可以上传；但上传前必须再扫一遍，命中 prompt 文本或 token 形态就把该文件
+      # 从 staging 目录删掉——宁可少传，也不许把正文带出公开仓库。
+      - name: "Stage diff/shape metadata and scan for prompt text"
+        if: always()
+        run: |
+          set -euo pipefail
+          EXTRA="$W/meta_extra"
+          rm -rf "$EXTRA"
+          mkdir -p "$EXTRA"
+          if [ -f "$W/schema_diff.json" ]; then cp "$W/schema_diff.json" "$EXTRA/"; fi
+          if [ -f "$W/shapes/matrix.json" ]; then cp "$W/shapes/matrix.json" "$EXTRA/"; fi
+          echo "staging:"
+          ls -la "$EXTRA" || true
+          set +e
+          python3 - "$EXTRA" "$W/candidate/prompt.txt" "$GITHUB_WORKSPACE/assets/prompt.txt" \
+            >"$W/meta_extra_scan.out" 2>&1 <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          extra = pathlib.Path(sys.argv[1])
+          prompt_paths = [pathlib.Path(p) for p in sys.argv[2:4]]
+          prompts = []
+          for path in prompt_paths:
+              if path.is_file():
+                  try:
+                      text = path.read_text(encoding="utf-8", errors="replace")
+                  except OSError:
+                      continue
+                  if text.strip():
+                      prompts.append((path, text))
+
+          # 与 candidate / assets 门禁同一套 token 形态（左边界 + 最小长度）
+          GUARD = r"(?<![A-Za-z0-9_])"
+          PATTERNS = [
+              ("Bearer ", re.compile(GUARD + r"Bearer ")),
+              ("ses_", re.compile(GUARD + r"ses_[A-Za-z0-9]{8,}")),
+              ("ghp_", re.compile(GUARD + r"ghp_[A-Za-z0-9]{16,}")),
+              ("sk-", re.compile(GUARD + r"sk-[A-Za-z0-9_-]{10,}")),
+              ("[0-9a-f]{24}", re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{24}(?![0-9a-fA-F])")),
+          ]
+
+          def windows(text, size=64, step=32):
+              """prompt 正文的 64 字符滑窗：命中的文件一定含 prompt 正文。"""
+              out = set()
+              for start in range(0, max(len(text) - size, 0) + 1, step):
+                  piece = text[start:start + size].strip()
+                  if len(piece) >= size // 2:
+                      out.add(piece)
+              return out
+
+          prompt_windows = []
+          for path, text in prompts:
+              prompt_windows.append((path, windows(text)))
+
+          bad = []
+          for path in sorted(extra.rglob("*")):
+              if not path.is_file():
+                  continue
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for label, pattern in PATTERNS:
+                  if pattern.search(text):
+                      bad.append((path, "token 形态命中：" + label))
+                      break
+              else:
+                  for origin, pieces in prompt_windows:
+                      hit = next((piece for piece in pieces if piece and piece in text), None)
+                      if hit is not None:
+                          bad.append((path, "命中 {0} 的正文片段".format(origin)))
+                          break
+
+          if bad:
+              for path, reason in bad:
+                  print("HIT {0}: {1}".format(path, reason))
+                  try:
+                      path.unlink()
+                  except OSError:
+                      pass
+              print("scan failed: 已删除命中文件，不上传")
+              sys.exit(1)
+          print("scan clean: 未发现 prompt 正文或 token 形态")
+          PY
+          SCAN_EXIT=$?
+          set -e
+          cat "$W/meta_extra_scan.out" || true
+          if [ "$SCAN_EXIT" -ne 0 ]; then
+            echo "::warning::diff/shape 元数据扫描命中，命中文件已删除，本次不上传对应内容"
+          fi
+          echo "SCAN_EXIT=$SCAN_EXIT" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: assets_diff_shapes
+          path: ${{ env.W }}/meta_extra
           if-no-files-found: warn
           retention-days: 7
 
