@@ -79,15 +79,29 @@ def write_ovpn(b64: str) -> bool:
 
 
 def convert() -> bool:
+    # --mixed 收的是 HOST:PORT，不是裸端口（传 "18080" 会生成没有 inbound 的配置，
+    # sing-box 起来但不监听，探测表现为 connection refused）。
     proc = subprocess.run(
         [sys.executable, CONVERTER, "--input", "node.ovpn", "--output", CONFIG,
-         "--mixed", str(MIXED_PORT)],
+         "--mixed", f"127.0.0.1:{MIXED_PORT}"],
         cwd=WORK, capture_output=True, text=True,
     )
     if proc.returncode != 0:
         print(f"  convert failed rc={proc.returncode}: {(proc.stderr or '')[-300:]}")
         return False
     return os.path.exists(CONFIG) and os.path.getsize(CONFIG) > 0
+
+
+def wait_port(port: int, timeout: float = 12.0) -> bool:
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket() as sock:
+            sock.settimeout(1)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(0.5)
+    return False
 
 
 def start_singbox() -> subprocess.Popen:
@@ -130,7 +144,15 @@ def main() -> int:
         if not convert():
             continue
         proc = start_singbox()
-        time.sleep(STARTUP_WAIT)
+        if not wait_port(MIXED_PORT):
+            print("  sing-box 没监听，日志尾部：")
+            try:
+                with open(SB_LOG, encoding="utf-8", errors="replace") as fh:
+                    print("\n".join(fh.read().splitlines()[-6:]))
+            except OSError:
+                pass
+            proc.terminate()
+            continue
         ip = probe()
         if ip:
             with open(PROXY_ENV, "w", encoding="utf-8") as fh:
