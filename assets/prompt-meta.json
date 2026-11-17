@@ -4,5 +4,5 @@
   "chars": 94858,
   "cli_version": "2.2.5",
   "captured_at": "2026-11-17T07:39:47Z",
-  "note": "public runner 只存摘要，全文在私有仓库 zen-assets（契约 §8）"
+  "note": "public runner 只存摘要；prompt 全文不在任何仓库，权威副本是网关源码树 tools/opencode_prompt_v2.txt"
 }

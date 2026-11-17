@@ -247,7 +247,7 @@ experimental_image_generate
 | 仓库 | 可见性 | 内容 |
 |---|---|---|
 | `zen-assets-runner` | public | 代码（`tools/` `tests/` `schema/`）、workflow、`assets/official_tools.json`、`assets/prompt-meta.json` |
-| `zen-assets` | private | `assets/prompt.txt` 全文、完整资产存档 |
+| `zen-assets` | private | 私有存档：契约文档（prompt 全文只在网关源码树里） |
 
 ### 8.1 为什么不能把老仓库直接改 public
 

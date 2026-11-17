@@ -501,7 +501,7 @@ jobs:
               "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "previous_sha256": previous.get("sha256"),
               "previous_bytes": previous.get("bytes"),
-              "note": "public runner 只存摘要，全文在私有仓库 zen-assets（契约 §8）",
+              "note": "public runner 只存摘要；prompt 全文不在任何仓库，权威副本是网关源码树 tools/opencode_prompt_v2.txt",
           }
           meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           print("prompt-meta: %s -> %s bytes" % (meta.get("previous_bytes"), meta["bytes"]))

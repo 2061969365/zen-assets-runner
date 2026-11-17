@@ -9,7 +9,7 @@
 | 仓库 | 可见性 | 放什么 |
 |---|---|---|
 | `zen-assets-runner`（本仓库） | public | 抓包代码、抽取器、校验器、workflow、`assets/official_tools.json`、`assets/prompt-meta.json`（只有 sha256 / 字节数） |
-| `zen-assets` | private | `assets/prompt.txt` 全文、完整资产存档 |
+| `zen-assets` | private | 私有存档：契约文档（prompt 全文只在网关源码树里） |
 
 这样做的原因：
 
