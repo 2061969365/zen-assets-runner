@@ -37,7 +37,7 @@ PROXY_ENV = os.path.join(WORK, "proxy.env")
 SB_LOG = os.path.join(WORK, "sb.log")
 
 MIXED_PORT = 18080
-MAX_NODES = 12
+MAX_NODES = 20
 PROBE_URL = "https://api.ipify.org"
 STARTUP_WAIT = 4.0
 
@@ -57,11 +57,16 @@ def parse_nodes(path: str) -> list[tuple[int, str, str]]:
             # 第 15 列（index 14）是 base64 OpenVPN 配置；列表头有 15 列
             if len(parts) < 15:
                 continue
+            host = parts[0]
+            # public-vpn-* 是 VPN Gate 的公共中继，握手经常被 reset（实测过一整轮全 fails）；
+            # 直接跳过，优先用真实 ISP 节点。
+            if host.startswith("public-vpn-"):
+                continue
             try:
                 score = int(parts[2] or 0)
             except ValueError:
                 score = 0
-            rows.append((score, parts[0], parts[14]))
+            rows.append((score, host, parts[14]))
     rows.sort(key=lambda r: r[0], reverse=True)
     return rows
 
