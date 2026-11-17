@@ -17,6 +17,21 @@ name: refresh-assets
 
 on:
   workflow_dispatch:
+    inputs:
+      egress:
+        description: "抓包与验收所用出口：direct / warp / vpngate"
+        required: false
+        type: choice
+        options:
+          - direct
+          - warp
+          - vpngate
+        default: "direct"
+      verify_e2e:
+        description: "抓到后是否派发 zen-direct-v2 的 asset-e2e 并回帖结果"
+        required: false
+        type: boolean
+        default: true
   schedule:
     - cron: '0 3 * * *'
 
@@ -39,6 +54,8 @@ jobs:
       W: ${{ github.workspace }}/_cap
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       GH_TOKEN: ${{ github.token }}
+      EGRESS: ${{ github.event.inputs.egress || 'direct' }}
+      VERIFY_E2E: ${{ github.event.inputs.verify_e2e || 'true' }}
       OPENCODE_DISABLE_AUTOUPDATE: '1'
     steps:
       - name: Checkout
@@ -48,6 +65,63 @@ jobs:
 
       # PR 上的 ci 会停在 action_required（GITHUB_TOKEN 推的分支触发的工作流需要人工
       # 批准），所以闸门必须在产出方就执行一遍：这里是唯一能让 PR 内容可信的地方。
+      # ---------- 出口（egress）----------
+      # 抓包本身是本地回环（CLI -> sink.py），出口 IP 不影响抓到什么；
+      # 「这套定义从某个出口 IP 打上游会不会被接受」是另一件事，由 sink 之后的
+      # 验收步骤在该出口上真打一次上游来回答。
+      - name: "Egress direct: show public IP"
+        if: env.EGRESS == 'direct'
+        run: |
+          echo "egress=direct"
+          curl -s -m 20 https://api.ipify.org || true
+          echo
+
+      - name: Install WARP (egress=warp)
+        if: env.EGRESS == 'warp'
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /usr/share/keyrings
+          curl -fsSL --retry 3 --retry-delay 1 https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+          sudo apt-get -o Acquire::Retries=3 update -y
+          sudo apt-get -o Acquire::Retries=3 install -y cloudflare-warp
+          sudo systemctl enable warp-svc >/dev/null 2>&1 || true
+          sudo systemctl start warp-svc >/dev/null 2>&1 || sudo service warp-svc start >/dev/null 2>&1 || true
+          for i in $(seq 1 30); do sudo systemctl is-active --quiet warp-svc && break; sleep 1; done
+          sudo warp-cli --accept-tos registration new
+          sudo warp-cli --accept-tos mode warp+doh
+          sudo warp-cli --accept-tos connect
+          sleep 3
+          sudo warp-cli --accept-tos status || true
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf >/dev/null
+          echo "egress IP: $(curl -s -m 25 https://api.ipify.org || echo unknown)"
+
+      - name: Setup vpngate egress (egress=vpngate)
+        if: env.EGRESS == 'vpngate'
+        run: |
+          set -euo pipefail
+          mkdir -p "$W/vp"
+          cd "$W/vp"
+          curl -fsSL --retry 3 -o nodes.csv "https://www.vpngate.net/api/iphone/"
+          echo "nodes.csv 行数=$(wc -l < nodes.csv)"
+          sb_tag=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+          sb_ver=${sb_tag#v}
+          curl -fsSL --retry 3 -o sb.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/${sb_tag}/sing-box-${sb_ver}-linux-amd64.tar.gz"
+          tar -xzf sb.tar.gz
+          install -m 0755 "sing-box-${sb_ver}-linux-amd64/sing-box" ./sing-box
+          ./sing-box version | head -2
+          curl -fsSL --retry 3 -o vpngate_to_singbox.py \
+            "https://raw.githubusercontent.com/2061969365/zen-vpngate-cloud-test/main/scripts/vpngate_to_singbox.py"
+          python3 tools/vpngate_pick.py
+          cat "$W/vp/proxy.env" >> "$GITHUB_ENV"
+          echo "vpngate 出口就绪"
+
       - name: Self-check (unit tests + current assets)
         run: |
           set -euo pipefail
@@ -114,6 +188,38 @@ jobs:
           echo "cli_exit=$CLI_EXIT captured_requests=$BODY_COUNT"
           tail -3 "$W/cli.out" || true
           tail -12 "$W/cli.err" || true
+
+      # 抓包只证明「CLI 发了什么」；这里证明「从当前出口 IP 打上游，这套东西能不能被接受」。
+      # 不经 sink，直接打真实上游，所以会消耗免费额度——一次一问。
+      - name: Egress acceptance check (real upstream, no sink)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          set +e
+          START=$(date +%s)
+          timeout --signal=TERM --kill-after=15 180 \
+            opencode run -m opencode/deepseek-v4.1-flash-free "Reply with the single word: ok" \
+            >"$W/acc.out" 2>"$W/acc.err"
+          ACC_EXIT=$?
+          ACC_SEC=$(( $(date +%s) - START ))
+          set -e
+          ACC_IP="$(curl -s -m 20 https://api.ipify.org || echo unknown)"
+          {
+            echo "ACC_EXIT=$ACC_EXIT"
+            echo "ACC_SEC=$ACC_SEC"
+            echo "ACC_IP=$ACC_IP"
+          } >> "$GITHUB_ENV"
+          echo "egress=$EGRESS ip=$ACC_IP exit=$ACC_EXIT 耗时=${ACC_SEC}s"
+          tail -5 "$W/acc.out" || true
+          tail -20 "$W/acc.err" || true
+          {
+            echo ""
+            echo "### 出口验收（真实上游）"
+            echo "- egress: \`$EGRESS\`"
+            echo "- 出口 IP: \`$ACC_IP\`"
+            echo "- exit: \`$ACC_EXIT\`（0 = 上游接受）"
+            echo "- 耗时: ${ACC_SEC}s"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Extract candidate assets
         # 分类依据优先取 extract_assets.py 自己的 --report-json 里的 status
@@ -601,6 +707,69 @@ jobs:
             echo "- branch: \`$BRANCH\`"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "DRIFT: PR 已开：$PR_URL"
+
+      # ---------- 把漂移 PR 送去 zen-direct-v2 实跑一轮 ----------
+      # 跨仓库 dispatch 需要一个对 zen-direct-v2 有 actions:write 的令牌，
+      # 这里用 secrets.ASSETS_E2E_TOKEN；没配就只警告、不阻断本流程。
+      # 结果会回帖到 PR 上（本仓库用自己的 GH_TOKEN 就有写权限）。
+      - name: Dispatch asset-e2e on zen-direct-v2 and report back
+        if: env.PR_URL != '' && env.VERIFY_E2E == 'true'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          TOKEN="${ASSETS_E2E_TOKEN:-}"
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::没有 ASSETS_E2E_TOKEN，跳过跨仓库实跑"
+            exit 0
+          fi
+          BRANCH="asset-drift/latest"
+          echo "派发 zen-direct-v2/asset-e2e（asset_ref=$BRANCH, egress=$EGRESS）"
+          if ! GH_TOKEN="$TOKEN" gh workflow run asset-e2e.yml \
+              -R 2061969365/zen-direct-v2 --ref main \
+              -f asset_ref="$BRANCH" -f egress="$EGRESS" -f scenario=all; then
+            echo "::warning::派发失败（检查 ASSETS_E2E_TOKEN 是否有 actions:write）"
+            exit 0
+          fi
+
+          # 等这个 dispatch 对应的 run 出现（最多 60s）
+          RUN_ID=""
+          for i in $(seq 1 20); do
+            sleep 3
+            RUN_ID="$(GH_TOKEN="$TOKEN" gh run list -R 2061969365/zen-direct-v2 \
+              --workflow asset-e2e --limit 5 --json databaseId,createdAt,event \
+              --jq '[.[] | select(.event=="workflow_dispatch")][0].databaseId' 2>/dev/null || true)"
+            [ -n "$RUN_ID" ] && break
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::warning::没找到刚派发的 run"
+            exit 0
+          fi
+          echo "run=$RUN_ID"
+
+          # 等结果（最多 20 分钟）
+          GH_TOKEN="$TOKEN" gh run watch "$RUN_ID" -R 2061969365/zen-direct-v2 \
+            --interval 20 --exit-status >/dev/null 2>&1 || true
+          CONCLUSION="$(GH_TOKEN="$TOKEN" gh run view "$RUN_ID" -R 2061969365/zen-direct-v2 \
+            --json conclusion --jq '.conclusion' 2>/dev/null || echo unknown)"
+
+          BODY="$(mktemp)"
+          {
+            echo "## 实跑结果：zen-direct-v2 / asset-e2e"
+            echo
+            echo "- 分支资产：\`$BRANCH\`"
+            echo "- 出口：\`$EGRESS\`"
+            echo "- 结论：**$CONCLUSION**"
+            echo "- run: https://github.com/2061969365/zen-direct-v2/actions/runs/$RUN_ID"
+            echo
+            echo "该工作流做的事：注入本 PR 的工具定义 → \`go build\` → 起网关 → 四个 scenario 打真实免费模型 →"
+            echo "判定 HTTP 200 与 \`tool_calls\`，并检查 \`/health\` 的 429/4xx/5xx 增量。"
+            echo
+            echo "> 合并前请确认结论为 \`success\`；失败时点上面的 run 看是哪一条 scenario。"
+          } > "$BODY"
+
+          PR_NUM="$(basename "$PR_URL" | tr -dc '0-9')"
+          gh pr comment "$PR_NUM" --body-file "$BODY" || echo "::warning::回帖失败"
+          echo "已回帖到 PR #$PR_NUM"
 
       # 契约 §8：public 仓库的 artifact 任何人可下载，所以**绝不能**上传 candidate
       # （里面有 prompt.txt 全文）。只上传不含正文的元数据。
