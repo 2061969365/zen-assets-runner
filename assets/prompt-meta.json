@@ -1,8 +1,10 @@
 {
-  "sha256": "8ae149145f203932aa8053bd80690e03d4bfad01be89de58f06eb69e8fbdd6e0",
-  "bytes": 102499,
-  "chars": 94858,
-  "cli_version": "2.2.5",
-  "captured_at": "2026-11-17T07:39:47Z",
+  "sha256": "e3c466c7a33e5ea63b5f12c05c6a40d9e1d5375553c46312405c542569aa72c8",
+  "bytes": 8565,
+  "chars": 8565,
+  "cli_version": "opencode v2.3.2",
+  "captured_at": "2026-11-21T10:37:21Z",
+  "previous_sha256": "8ae149145f203932aa8053bd80690e03d4bfad01be89de58f06eb69e8fbdd6e0",
+  "previous_bytes": 102499,
   "note": "public runner 只存摘要；prompt 全文不在任何仓库，权威副本是网关源码树 tools/opencode_prompt_v2.txt"
 }
